@@ -25,10 +25,6 @@ type Item struct {
 	Category 	string 	`json:"category"`
 	ImageName 	string 	`json:"image"`
 }
-type Category struct {
-	ID			int 	`json:"id"`
-	Category 	string 	`json:"category_id"`
-}
 
 type Items struct {
 	Items []Item `json:"items"`
