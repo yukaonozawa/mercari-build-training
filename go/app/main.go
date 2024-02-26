@@ -6,22 +6,24 @@ import (
 	"os"
 	"path"
 	"strings"
-	"encoding/json"
-	"io/ioutil"
 	"crypto/sha256"
 	"encoding/hex"
 	"io"
+	"database/sql"
+	"strconv"
+	"mime/multipart"
 
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
 	"github.com/labstack/gommon/log"
+	_ "github.com/mattn/go-sqlite3"
 )
 
 type Item struct {
-	Name 		string `json:"name"`
-	Category 	string `json:"category"`
-	Image 		string `json:"image"`
-	IDNumber 	string `json:"idnumber"`
+	ID			int 	`json:"id"`
+	Name 		string 	`json:"name"`
+	Category 	string 	`json:"category"`
+	ImageName 	string 	`json:"image"`
 }
 
 type Items struct {
@@ -31,6 +33,8 @@ type Items struct {
 const (
 	ImgDir = "images"
 	ItemsJson = "app/items.json"
+	DBPath = "../db/mercari.sqlite3"
+	SelectAllQuery = "SELECT items.id, items.name, categories.name AS category, items.image_name FROM items INNER JOIN categories ON items.category_id = categories.id"
 )
 
 type Response struct {
@@ -42,29 +46,70 @@ func root(c echo.Context) error {
 	return c.JSON(http.StatusOK, res)
 }
 
-func readItemsFromFile() ([]Item, error) {
-	data, err := ioutil.ReadFile(ItemsJson)
+func errorHandler(err error, c echo.Context, code int, message string) *echo.HTTPError {
+	return echo.NewHTTPError (code, message)
+}
+
+func readItemsFromDB() ([]Item, error) {
+	db, err := sql.Open("sqlite3", DBPath)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("Could not open sqlite db file")
+	}
+	defer db.Close()
+	
+	rows, err := db.Query(SelectAllQuery)
+	if err != nil{
+		return nil, fmt.Errorf("Something went wrong with the query selecting all items ")
+	}
+
+	var items []Item
+
+	for rows.Next() {
+		var item Item
+	
+		if err := rows.Scan(&item.ID, &item.Name, &item.Category, &item.ImageName); err != nil {
+			return nil, fmt.Errorf("Could not scan information from db file rows")
+		}
+		items = append(items, item)
+	}
+
+	return items, nil
+}
+
+func getCategoryID(db *sql.DB, category string) (int, error) {
+	var catID int
+	row, err := db.Query("SELECT id FROM categories WHERE name LIKE (?)", category)
+	if err != nil{
+		return 0, fmt.Errorf("Could not open sql db: %v", err)
+	}
+	defer row.Close()
+
+	if !row.Next(){
+		_, err = db.Exec("INSERT INTO categories (name) VALUES (?)", category)
+		if err != nil {
+			return 0, fmt.Errorf("Could insert new category: %v", err)
+		}
+		row, err = db.Query("SELECT id FROM categories WHERE name LIKE (?)", category)
+		if err != nil{
+			return 0, fmt.Errorf("Could not get id of new category: %v", err)
+		}
+		defer row.Close()
+	} 
+	
+	for row.Next() {
+		if err := row.Scan(&catID); err != nil {
+			return 0, fmt.Errorf("Could not scan category ID number into catID")
+		}	
 	}
 	
-	var items Items
-
-	err = json.Unmarshal(data, &items)
-	if err != nil {
-		return nil, err
-	}
-
-	return items.Items, nil
+	return catID, err
 }
 
 func getItems(c echo.Context) error {
-	items, err := readItemsFromFile()
-
+	items, err := readItemsFromDB()
 	if err != nil {
-		return err
-	}
-	
+		return errorHandler(err, c, http.StatusInternalServerError, "Could not read items from DB")
+	}	
 	return c.JSON(http.StatusOK, Items{Items:items})
 }
 
@@ -73,82 +118,45 @@ func addItem(c echo.Context) error {
 	name := c.FormValue("name")
 	category := c.FormValue("category")
 	image, err := c.FormFile("image")
-	idnumber := c.FormValue("idnumber")
-
 	if err != nil {
 		return errorHandler(err, c, http.StatusBadRequest, "Image not found")
 	}
-	// Making sure no two same IDs are registered
-	currentItems, err := readItemsFromFile()
+	c.Logger().Debugf("Received item. Name: %s, Category: %s", name, category)
+
+	hashString, err := imageHasher(image)
 	if err != nil {
-		return errorHandler(err, c, http.StatusInternalServerError, "Could not retrieve items")
+		c.Logger().Debugf("Error hashing image %v", err)
+		return errorHandler(err, c, http.StatusInternalServerError, "Could not hash image")
 	}
 
-	var idList []string
-	for _, item := range currentItems {
-		idList = append(idList, item.IDNumber)
+	if err = addItemtoDB(name, category, hashString); err != nil {
+		c.Logger().Debugf("Error adding to db: %v", err)
+		return errorHandler(err, c, http.StatusInternalServerError, "Could not add item" + name + category + hashString)
 	}
 
-	for _, id := range idList {
-		if id == idnumber {
-			res := Response{Message:"That ID already exists"}
-			return c.JSON(http.StatusBadRequest, res)
-		} 
-	} 
-
-	c.Logger().Infof("Receive item: %s. Category: %s", name, category)
-
-	// hash img
-	imgFile, err := image.Open()
-	if err != nil {
-		return errorHandler(err, c, http.StatusBadRequest, "Image not found")
-	}
-	defer imgFile.Close()
-
-	hasher := sha256.New()
-	if _, err := io.Copy(hasher, imgFile); err != nil {
-		return errorHandler(err, c, http.StatusInternalServerError, "Couldn't hash")
-	}
-	hashed := hasher.Sum(nil)
-	hashString := hex.EncodeToString(hashed)
-
-	hashString += ".jpg"
-
-	err = addItemtoJson(name, category, hashString, idnumber)
-	if err != nil {
-		return errorHandler(err, c, http.StatusInternalServerError, "Could not add items")
-	}
-
-	message := fmt.Sprintf("item received: %s, %s, ID number %s", name, category, idnumber)
+	message := fmt.Sprintf("item received: %s, %s", name, category)
 	res := Response{Message: message}
 
 	return c.JSON(http.StatusOK, res)
 }
 
-func addItemtoJson(name string, category string, image string, idnumber string) error {
-	file, err := os.OpenFile(ItemsJson, os.O_RDWR, 0755)
+func addItemtoDB(name string, category string, image string) error {
+	db, err := sql.Open("sqlite3", DBPath)
 	if err != nil {
-		return err
+		return fmt.Errorf("Could not open sql db")
 	}
-	defer file.Close() 
-
-	currentItems, err := readItemsFromFile()
+	defer db.Close() 
+	
+	catID, err := getCategoryID(db, category)
 	if err != nil {
-		return err
-	}
-
-	newItem := Item{Name: name, Category: category, Image: image, IDNumber: idnumber}
-
-	currentItems = append(currentItems, newItem)
-
-	file.Truncate(0)
-	file.Seek(0, 0)
-
-	err = json.NewEncoder(file).Encode(Items{Items:currentItems})
-	if err != nil {
-		return err
+		return fmt.Errorf("Could not get catID: %v", err)
 	}
 
+	_, err = db.Exec("INSERT INTO items (name, category_id, image_name) VALUES (?,?,?)", name, catID, image)
+	if err != nil {
+		return fmt.Errorf("Could not insert item")
+	}
+	
 	return nil
 }
 
@@ -168,24 +176,74 @@ func getImg(c echo.Context) error {
 }
 
 func getItemById(c echo.Context) error {
-	receivedIDNumber := c.Param("idnumber")
+	receivedID := c.Param("id")
+	receivedIDint, err := strconv.Atoi(receivedID)
+	if err != nil {
+		errorHandler(err, c, http.StatusInternalServerError, "Could not convert id to int")
+	}
 
-	items, err := readItemsFromFile()
+	items, err := readItemsFromDB()
 	if err != nil {
 		errorHandler(err, c, http.StatusInternalServerError, "Could not open file")
 	}
 
 	for _, item := range items {
-		if item.IDNumber == receivedIDNumber{
+		if item.ID == receivedIDint{
 			return c.JSON(http.StatusOK, item)
 		}
 	}
-
 	return c.JSON(http.StatusNotFound, Response{Message: "Item with that ID was not found"})
 }
 
-func errorHandler(err error, c echo.Context, code int, message string) *echo.HTTPError {
-	return echo.NewHTTPError (code, message)
+func getItemBySearch(c echo.Context) error{
+	keyword := c.QueryParam("keyword")
+	c.Logger().Debugf("keyword received: " + keyword)
+	var searchList []Item
+
+	db, err := sql.Open("sqlite3", DBPath)
+	if err != nil {
+		errorHandler(err, c, http.StatusInternalServerError, "Could not open file")
+	}
+	defer db.Close() 
+	
+	rows, err := db.Query(SelectAllQuery + " WHERE LOWER(items.name) LIKE '%" + strings.ToLower(keyword) + "%'")
+	if err != nil{
+		errorHandler(err, c, http.StatusInternalServerError, "Could not retrieve items with key word")
+	}
+	
+	for rows.Next() {
+		var item Item
+	
+		if err := rows.Scan(&item.ID, &item.Name, &item.Category, &item.ImageName); err != nil {
+			errorHandler(err, c, http.StatusInternalServerError, "Could scan items")
+		}
+		c.Logger().Debugf("An item was picked up in the search")
+		searchList = append(searchList, item)
+	}
+
+	if len(searchList) == 0{
+		return c.JSON(http.StatusOK, Response{Message:"No such items found with the keyword " + keyword})
+	}
+
+	return c.JSON(http.StatusOK, Items{Items:searchList})
+}
+
+func imageHasher(image *multipart.FileHeader) (string, error) {
+	imgFile, err := image.Open()
+	if err != nil {
+		return "", fmt.Errorf("Could not open image file")
+	}
+	defer imgFile.Close()
+
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, imgFile); err != nil {
+		return "", fmt.Errorf("Could not carry out hash")
+	}
+	hashed := hasher.Sum(nil)
+	hashString := hex.EncodeToString(hashed)
+
+	hashString += ".jpg"
+	return hashString, nil
 }
 
 func main() {
@@ -194,7 +252,7 @@ func main() {
 	// Middleware
 	e.Use(middleware.Logger())
 	e.Use(middleware.Recover())
-	e.Logger.SetLevel(log.INFO)
+	e.Logger.SetLevel(log.DEBUG)
 
 	frontURL := os.Getenv("FRONT_URL")
 	if frontURL == "" {
@@ -210,7 +268,8 @@ func main() {
 	e.POST("/items", addItem)
 	e.GET("/items", getItems)
 	e.GET("/image/:imageFilename", getImg)
-	e.GET("/items/:idnumber", getItemById)
+	e.GET("/items/:id", getItemById)
+	e.GET("/search", getItemBySearch)
 
 	// Start server
 	e.Logger.Fatal(e.Start(":9000"))
